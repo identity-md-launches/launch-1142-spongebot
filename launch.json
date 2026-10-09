@@ -1,0 +1,30 @@
+{
+  "kind": "univ4_hook",
+  "token": {
+    "contract": "SPONGEBOT",
+    "name": "SpongeBot",
+    "symbol": "SPONGEBOT",
+    "decimals": 18
+  },
+  "hook": {
+    "contract": "SpongeBotHook",
+    "constructorArgs": [
+      "$poolManager",
+      "$token"
+    ],
+    "permissions": [
+      "beforeInitialize",
+      "beforeSwap",
+      "afterSwap",
+      "beforeSwapReturnDelta",
+      "afterSwapReturnDelta"
+    ]
+  },
+  "pool": {
+    "pairedCurrency": "0xd34a99bc0f67ae1bbd63c660e6d0b0dd03e263b7",
+    "fee": 12500,
+    "tickSpacing": 60,
+    "initialPrice": "79228162514264337593543950336"
+  },
+  "notes": "SpongeBotHook is a plain immutable contract with no owner, setter, proxy, delegatecall or selfdestruct. Constructor args, in declaration order: $poolManager (the chain's Uniswap v4 PoolManager, 0x000000000004444c5dc75cB358380D2e3dE08A90 on Ethereum mainnet) and $token (the SPONGEBOT launch token the factory deploys just before the hook). The constructor itself deploys SpongeBotVault(token, IMD, hook); its address is immutable and readable as vault(). The paired currency IMD 0xd34a99bc0f67ae1bbd63c660e6d0b0dd03e263b7 and the SIMD Hackathon vault 0x3dd5f73dd1a4e62630fad3909673f130ad429985 are constants in the hook. Permission bits: the CREATE2-mined hook address must carry 0x20CC = beforeInitialize (8192) | beforeSwap (128) | afterSwap (64) | beforeSwapReturnDelta (8) | afterSwapReturnDelta (4), exactly what getHookPermissions() returns. beforeInitialize accepts calls only from the PoolManager, only the {SPONGEBOT, IMD} pair with a static LP fee (the launch's 12500 tier is accepted; the dynamic-fee flag is refused), records the opening block once and refuses a second initialization. Fees: both hook fees are taken in IMD on top of the pool's static 1.25% LP fee (fee 12500, never dynamic, never overridden) through beforeSwap/afterSwap return deltas and are proportional to what actually filled. (1) Anti-snipe: 3000 bps (30%) in the opening block, decaying linearly by 300 bps per block to 0 from block 10 after the pool opened. (2) Staking: 100 bps (1%) of the IMD side of every swap, forever. When IMD is the unspecified currency (exact-input sell, exact-output buy) afterSwap takes the fee from the real IMD BalanceDelta. When IMD is the specified currency (exact-input buy, exact-output sell) beforeSwap reserves the fee from the specified amount and afterSwap recomputes it from the real fill and refunds the excess to the swapper (the sender the PoolManager reports) as an IMD ERC-6909 claim. Fees are minted to the hook as ERC-6909 claims and booked in pendingAntiSnipe/pendingStaking; pending() returns the sum. Nothing is swapped, burned or donated inside a swap callback and the hook never reverts a real swap; only a specified amount so large that adding the fee would overflow int256 reverts with UnrepresentableFee. sweep() is callable by anyone in its own transaction: it unlocks the PoolManager, burns the claims, takes the anti-snipe share to the SIMD Hackathon vault and the staking share to SpongeBotVault, then calls notifyReward(amount) on the vault. SpongeBotVault is a reward-per-token accumulator weighted by stake and blocks held: holders stake SPONGEBOT, earn IMD, and can stake, unstake, claim and exit at any time; rewards arriving while nothing is staked are queued for the next stakers; only the hook may call notifyReward. Views: earned(address), totalStaked(), pending() on the hook. No contract here receives any part of the supply at launch; the token mints the whole 1e27 units to its deployer."
+}
