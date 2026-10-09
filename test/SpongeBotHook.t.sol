@@ -13,8 +13,11 @@ import {SwapParams} from "v4-core/src/types/PoolOperation.sol";
 import {HookFlags} from "../src/HookFlags.sol";
 import {SpongeBotHook} from "../src/SpongeBotHook.sol";
 import {SpongeBotVault} from "../src/SpongeBotVault.sol";
+import {IERC20Minimal} from "v4-core/src/interfaces/external/IERC20Minimal.sol";
+import {PoolSwapTest} from "v4-core/src/test/PoolSwapTest.sol";
 import {MockERC20} from "./mocks/MockERC20.sol";
 import {HookTestBase} from "./utils/HookTestBase.sol";
+import {PreSyncSwapRouter} from "./utils/PreSyncSwapRouter.sol";
 
 /// @notice Hook tests against a fresh local PoolManager with a mock ERC-20 standing in at IMD's address.
 contract SpongeBotHookTest is HookTestBase {
@@ -168,7 +171,7 @@ contract SpongeBotHookTest is HookTestBase {
         returns (uint256 fee, uint256 refund)
     {
         fee = manager.balanceOf(address(hook), IMD_ID) - hookClaimsBefore;
-        refund = manager.balanceOf(address(swapRouter), IMD_ID) - routerClaimsBefore;
+        refund = _routerRefund() - routerClaimsBefore;
         assertEq(fee, poolImd * rate / BPS, "fee is the rate on what moved through the pool");
         assertEq(hook.pending(), manager.balanceOf(address(hook), IMD_ID), "pending equals claims");
         assertEq(hook.pendingStaking(), poolImd * 100 / BPS, "staking share");
@@ -189,12 +192,12 @@ contract SpongeBotHookTest is HookTestBase {
         assertEq(_imdDelta(delta), -int256(amountIn));
         assertGt(token.balanceOf(address(this)) - tokenBefore, 0, "received tokens");
         uint256 fee = manager.balanceOf(address(hook), IMD_ID);
-        uint256 refund = manager.balanceOf(address(swapRouter), IMD_ID);
+        uint256 refund = _routerRefund();
         uint256 poolImd = amountIn - fee - refund;
         (uint256 f,) = _assertFee(poolImd, rate, 0, 0);
         assertApproxEqAbs(f, amountIn * 3_100 / 13_100, 2, "about 23.7% of gross, 31% of pool input");
         assertLe(refund, 1, "full fill refunds at most rounding dust");
-        assertEq(_imdBalance(address(manager)) - managerBefore, amountIn, "manager holds it all");
+        assertEq(_imdBalance(address(manager)) - managerBefore, amountIn - refund, "manager holds the rest");
     }
 
     function test_buyExactOutputDuringAntiSnipe() public {
@@ -242,7 +245,7 @@ contract SpongeBotHookTest is HookTestBase {
         assertEq(received, amountOut, "receives exactly the requested IMD");
         assertEq(uint256(uint128(_imdDelta(delta))), amountOut);
         uint256 fee = manager.balanceOf(address(hook), IMD_ID);
-        uint256 refund = manager.balanceOf(address(swapRouter), IMD_ID);
+        uint256 refund = _routerRefund();
         uint256 poolImd = amountOut + fee + refund;
         _assertFee(poolImd, rate, 0, 0);
         assertLe(refund, 1, "full fill refunds at most rounding dust");
@@ -254,7 +257,7 @@ contract SpongeBotHookTest is HookTestBase {
         uint256 amountIn = 1_000 ether;
         _buy(-int256(amountIn), 0);
         uint256 fee = manager.balanceOf(address(hook), IMD_ID);
-        uint256 refund = manager.balanceOf(address(swapRouter), IMD_ID);
+        uint256 refund = _routerRefund();
         uint256 poolImd = amountIn - fee - refund;
         assertEq(fee, poolImd * 100 / BPS);
         assertEq(hook.pendingAntiSnipe(), 0);
@@ -291,7 +294,7 @@ contract SpongeBotHookTest is HookTestBase {
         assertEq(_sqrtPrice(), limit, "stopped at the limit");
         uint256 paid = imdBefore - _imdBalance(address(this));
         uint256 fee = manager.balanceOf(address(hook), IMD_ID);
-        uint256 refund = manager.balanceOf(address(swapRouter), IMD_ID);
+        uint256 refund = _routerRefund();
         uint256 reserved = fee + refund;
         uint256 poolImd = paid - reserved;
         assertLt(poolImd, amountIn / 10, "a small fraction filled");
@@ -314,7 +317,7 @@ contract SpongeBotHookTest is HookTestBase {
         assertEq(_sqrtPrice(), limit, "stopped at the limit");
         uint256 received = _imdBalance(address(this)) - imdBefore;
         uint256 fee = manager.balanceOf(address(hook), IMD_ID);
-        uint256 refund = manager.balanceOf(address(swapRouter), IMD_ID);
+        uint256 refund = _routerRefund();
         uint256 reserved = fee + refund;
         uint256 poolImd = received + reserved;
         assertLt(poolImd, amountOut / 2, "a fraction filled");
@@ -336,7 +339,7 @@ contract SpongeBotHookTest is HookTestBase {
 
         int256 walletChange = int256(_imdBalance(address(this))) - imdBefore;
         uint256 fee = manager.balanceOf(address(hook), IMD_ID);
-        uint256 refund = manager.balanceOf(address(swapRouter), IMD_ID);
+        uint256 refund = _routerRefund();
         assertLt(walletChange, 0, "wallet paid the difference");
         int256 poolImd = walletChange + int256(fee + refund);
         assertGt(poolImd, 0);
@@ -353,7 +356,7 @@ contract SpongeBotHookTest is HookTestBase {
         uint256 received = _imdBalance(address(this)) - imdBefore;
         uint256 fee = manager.balanceOf(address(hook), IMD_ID);
         assertEq(fee, (received + fee) * rate / BPS);
-        assertEq(manager.balanceOf(address(swapRouter), IMD_ID), 0);
+        assertEq(_routerRefund(), 0);
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -365,6 +368,118 @@ contract SpongeBotHookTest is HookTestBase {
         _sell(type(int256).max, 0);
         vm.expectRevert();
         _buy(type(int256).min, 0);
+    }
+
+    /// @notice The top of the domain, where `a x b` fits but the ceiling's `+ d - 1` would not: the revert is the
+    /// documented UnrepresentableFee, never an arithmetic panic.
+    function test_unrepresentableFeeAtTopOfDomainIsTheCustomError() public {
+        assertEq(hook.feeBps(), 3_100);
+        int256 top = int256(type(uint256).max / 3_100);
+        for (int256 k = 0; k < 6; k++) {
+            vm.prank(address(manager));
+            vm.expectRevert(SpongeBotHook.UnrepresentableFee.selector);
+            hook.beforeSwap(address(this), key, SwapParams(imdIsCurrency0, -(top - k), 0), "");
+            vm.prank(address(manager));
+            vm.expectRevert(SpongeBotHook.UnrepresentableFee.selector);
+            hook.beforeSwap(address(this), key, SwapParams(!imdIsCurrency0, top - k, 0), "");
+        }
+        // After the window the rate is 100 bps and the window of affected inputs moves with it.
+        vm.roll(hook.poolOpenBlock() + 10);
+        top = int256(type(uint256).max / 100);
+        for (int256 k = 0; k < 101; k += 25) {
+            vm.prank(address(manager));
+            vm.expectRevert(SpongeBotHook.UnrepresentableFee.selector);
+            hook.beforeSwap(address(this), key, SwapParams(imdIsCurrency0, -(top - k), 0), "");
+        }
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Refund delivery: hookData recipient, IMD transfer vs. claim
+    // ---------------------------------------------------------------------------------------------
+
+    /// @notice A swapper behind any router names itself in hookData and receives the partial-fill refund as IMD
+    /// in its own wallet; nothing is left on the router.
+    function test_partialFillRefundReachesHookDataRecipientAsImd() public {
+        uint256 rate = hook.feeBps();
+        uint256 amountIn = 100_000 ether;
+        uint160 price = _sqrtPrice();
+        uint160 limit = imdIsCurrency0 ? price - price / 100 : price + price / 100;
+        address user = makeAddr("user");
+        _fundImd(user, amountIn);
+        vm.startPrank(user);
+        IERC20Minimal(IMD).approve(address(swapRouter), type(uint256).max);
+        swapRouter.swap(
+            key,
+            SwapParams(imdIsCurrency0, -int256(amountIn), limit),
+            PoolSwapTest.TestSettings(false, false),
+            abi.encode(user)
+        );
+        vm.stopPrank();
+
+        uint256 fee = manager.balanceOf(address(hook), IMD_ID);
+        uint256 paid = amountIn - _imdBalance(user);
+        uint256 poolImd = fee * BPS / rate; // the fill, up to rounding
+        assertEq(fee, (paid - fee) * rate / BPS, "fee is the rate on what filled");
+        assertLt(paid, amountIn / 5, "a partial fill: most of the input never left the wallet");
+        assertApproxEqAbs(paid, poolImd + fee, poolImd / 1e9, "wallet paid fill plus fee only");
+        assertEq(_routerRefund(), 0, "nothing stranded on the router");
+        assertEq(manager.balanceOf(user, IMD_ID), 0, "no claim needed: the manager covered the refund in IMD");
+    }
+
+    function test_refundRecipientDefaultsToRouterAndIgnoresMalformedHookData() public {
+        uint160 price = _sqrtPrice();
+        uint160 limit = imdIsCurrency0 ? price - price / 10_000 : price + price / 10_000;
+        _swap(imdIsCurrency0, -10_000 ether, limit, hex"01");
+        assertGt(_imdBalance(address(swapRouter)), 0, "refund went to the router as IMD");
+        uint256 before = _imdBalance(address(swapRouter));
+        _swap(imdIsCurrency0, -10_000 ether, imdIsCurrency0 ? limit - limit / 10_000 : limit + limit / 10_000, "");
+        assertGt(_imdBalance(address(swapRouter)), before);
+        // A zero recipient falls back to the router as well.
+        before = _imdBalance(address(swapRouter));
+        _swap(
+            imdIsCurrency0,
+            -10_000 ether,
+            imdIsCurrency0 ? limit - limit / 5_000 : limit + limit / 5_000,
+            abi.encode(address(0))
+        );
+        assertGt(_imdBalance(address(swapRouter)), before);
+    }
+
+    /// @notice A router that syncs and pays IMD before the swap must not have IMD transferred out from under its
+    /// settle: the hook sees the synced currency and refunds with a claim instead, and the swap completes.
+    function test_refundIsClaimWhileImdIsTheSyncedCurrency() public {
+        PreSyncSwapRouter preSync = new PreSyncSwapRouter(manager);
+        IERC20Minimal(IMD).approve(address(preSync), type(uint256).max);
+        uint256 rate = hook.feeBps();
+        uint256 amountIn = 10_000 ether;
+        uint160 price = _sqrtPrice();
+        uint160 limit = imdIsCurrency0 ? price - price / 10_000 : price + price / 10_000;
+        uint256 imdBefore = _imdBalance(address(this));
+
+        vm.expectEmit(true, false, false, false, address(hook));
+        emit SpongeBotHook.Refunded(address(this), 0, true);
+        preSync.swap(key, SwapParams(imdIsCurrency0, -int256(amountIn), limit), amountIn, abi.encode(address(this)));
+
+        uint256 fee = manager.balanceOf(address(hook), IMD_ID);
+        uint256 refund = manager.balanceOf(address(this), IMD_ID);
+        assertGt(refund, fee, "most of the reservation came back, as a claim");
+        uint256 paid = imdBefore - _imdBalance(address(this));
+        assertEq(fee, (paid - fee - refund) * rate / BPS, "fee on what filled only");
+        assertEq(_imdBalance(address(preSync)), 0);
+        assertEq(manager.balanceOf(address(preSync), IMD_ID), 0);
+
+        // The claim is turned into IMD through the hook, by its holder, at any later time.
+        manager.setOperator(address(hook), true);
+        hook.redeemRefund(refund);
+        assertEq(manager.balanceOf(address(this), IMD_ID), 0);
+        assertEq(imdBefore - _imdBalance(address(this)), paid - refund, "net cost is fill plus fee");
+    }
+
+    function test_redeemRefundNeedsApprovalAndAmount() public {
+        vm.expectRevert(SpongeBotHook.ZeroAmount.selector);
+        hook.redeemRefund(0);
+        vm.expectRevert();
+        hook.redeemRefund(1); // no claim and no approval
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -387,7 +502,7 @@ contract SpongeBotHookTest is HookTestBase {
 
         assertEq(_imdBalance(hook.HACKATHON_VAULT()), anti, "anti-snipe to hackathon vault");
         assertEq(_imdBalance(address(vault)), staking, "staking fee to vault");
-        assertEq(vault.queuedRewards(), staking, "notified while nothing staked: queued");
+        assertApproxEqAbs(vault.unstreamedRewards(), staking, 1, "notified while nothing staked: stream paused");
         assertEq(hook.pending(), 0);
         assertEq(manager.balanceOf(address(hook), IMD_ID), 0, "claims burned");
 
@@ -408,13 +523,14 @@ contract SpongeBotHookTest is HookTestBase {
         uint256 staking = hook.pendingStaking();
         hook.sweep();
 
-        // Alice has 100 x 10 = 1000e18 stake-blocks; the rate's remainder (under 1000 wei) is queued, not lost.
-        uint256 queued = vault.queuedRewards();
-        assertLe(queued, 1_000);
-        assertApproxEqAbs(vault.earned(alice) + queued, staking, 1);
+        assertEq(vault.earned(alice), 0, "nothing paid in the sweep block");
+        vm.roll(block.number + vault.REWARD_DURATION() / 2);
+        assertApproxEqAbs(vault.earned(alice), staking / 2, 1, "half streamed half way through");
+        vm.roll(block.number + vault.REWARD_DURATION());
+        assertApproxEqAbs(vault.earned(alice), staking, 1, "the whole fee reaches the staker");
         vm.prank(alice);
         vault.claim();
-        assertApproxEqAbs(_imdBalance(alice) + queued, staking, 1);
+        assertApproxEqAbs(_imdBalance(alice), staking, 1);
     }
 
     /// @notice The reopened finding: staking in the sweep's block earns nothing from it; stake-time earns.
@@ -443,8 +559,8 @@ contract SpongeBotHookTest is HookTestBase {
 
         assertEq(_imdBalance(bot), 0, "zero blocks of stake earns nothing");
         assertEq(token.balanceOf(bot), 9_900 ether);
-        assertApproxEqAbs(vault.earned(alice) + vault.queuedRewards(), staking, 1);
-        assertGt(vault.earned(alice), staking * 99 / 100);
+        vm.roll(block.number + vault.REWARD_DURATION());
+        assertApproxEqAbs(vault.earned(alice), staking, 1, "the long-term staker gets it all");
     }
 
     function test_sweepRevertsWhenNothingPending() public {
@@ -478,11 +594,11 @@ contract SpongeBotHookTest is HookTestBase {
         else _sell(specified, limit);
 
         uint256 fee = manager.balanceOf(address(hook), IMD_ID);
-        uint256 refund = manager.balanceOf(address(swapRouter), IMD_ID);
+        uint256 refund = _routerRefund();
         // Wallet change is negative on buys, positive on sells, except a tiny exact-output sell fill (see README).
         int256 walletChange = int256(_imdBalance(address(this))) - imdBefore;
         int256 managerChange = int256(_imdBalance(address(manager))) - managerBefore;
-        assertEq(managerChange, -walletChange, "conservation");
+        assertEq(managerChange + int256(_imdBalance(address(swapRouter))), -walletChange, "conservation");
         // Pool-side IMD: what the swapper paid or received, corrected for the claims left in the manager.
         int256 poolImdSigned = isBuy ? -walletChange - int256(fee + refund) : walletChange + int256(fee + refund);
         assertGe(poolImdSigned, 0);
@@ -497,6 +613,8 @@ contract SpongeBotHookTest is HookTestBase {
 
 /// @notice A launch-like pool: fresh manager seeded with SPONGEBOT only, no IMD inside the manager.
 contract SpongeBotHookTokenOnlySeedTest is HookTestBase {
+    uint256 constant BPS = 10_000;
+
     function _poolManager() internal override returns (IPoolManager) {
         return IPoolManager(address(new PoolManager(address(this))));
     }
@@ -517,7 +635,7 @@ contract SpongeBotHookTokenOnlySeedTest is HookTestBase {
         uint256 amountIn = 100 ether;
         _buy(-int256(amountIn), 0);
         uint256 fee = manager.balanceOf(address(hook), IMD_ID);
-        uint256 refund = manager.balanceOf(address(swapRouter), IMD_ID);
+        uint256 refund = _routerRefund();
         assertEq(fee, (amountIn - fee - refund) * rate / 10_000);
         assertGt(token.balanceOf(address(this)), 1e27 - 1_000_000 ether, "received tokens");
 
@@ -527,6 +645,45 @@ contract SpongeBotHookTokenOnlySeedTest is HookTestBase {
         assertEq(_imdBalance(hook.HACKATHON_VAULT()), anti);
         assertEq(_imdBalance(address(vault)), staking);
         assertEq(anti + staking, fee);
+    }
+
+    /// @notice The reopened finding's scenario: a price-limited exact-input buy on the launch pool before any IMD
+    /// is in the manager. The manager cannot cover the refund in IMD, so it is a claim minted to the hookData
+    /// recipient (the swapper), who redeems it through the hook once the pool holds IMD.
+    function test_partialFillRefundOnTokenOnlyPoolIsClaimToSwapperAndRedeemable() public {
+        uint256 rate = hook.feeBps();
+        assertEq(rate, 3_100);
+        uint256 amountIn = 1_000_000 ether;
+        uint160 price = _sqrtPrice();
+        uint160 limit = imdIsCurrency0 ? price - price / 100 : price + price / 100;
+        uint256 imdBefore = _imdBalance(address(this));
+        assertEq(_imdBalance(address(manager)), 0, "no IMD in the manager: the refund cannot be paid in IMD");
+
+        vm.expectEmit(true, false, false, false, address(hook));
+        emit SpongeBotHook.Refunded(address(this), 0, true);
+        _swap(imdIsCurrency0, -int256(amountIn), limit, abi.encode(address(this)));
+
+        uint256 fee = manager.balanceOf(address(hook), IMD_ID);
+        uint256 claim = manager.balanceOf(address(this), IMD_ID);
+        uint256 paid = imdBefore - _imdBalance(address(this));
+        uint256 poolImd = paid - fee - claim;
+        assertEq(fee, poolImd * rate / BPS, "fee on what filled only");
+        assertGt(claim, poolImd, "the unfilled reservation came back to the swapper");
+        assertEq(_routerRefund(), 0, "nothing on the router");
+        assertEq(_imdBalance(address(manager)), paid, "the manager now holds the fill, the fee and the claim");
+
+        // Redeem: the claim is backed by the IMD the swap itself brought into the manager.
+        manager.setOperator(address(hook), true);
+        vm.expectEmit(true, true, true, true, address(hook));
+        emit SpongeBotHook.RefundRedeemed(address(this), claim);
+        hook.redeemRefund(claim);
+        assertEq(manager.balanceOf(address(this), IMD_ID), 0);
+        assertEq(imdBefore - _imdBalance(address(this)), poolImd + fee, "net cost is fill plus fee");
+        manager.setOperator(address(hook), false);
+
+        // The fee is still sweepable afterwards.
+        hook.sweep();
+        assertEq(_imdBalance(hook.HACKATHON_VAULT()) + _imdBalance(address(vault)), fee);
     }
 
     function test_firstExactOutputBuyOnTokenOnlyPoolSucceeds() public {

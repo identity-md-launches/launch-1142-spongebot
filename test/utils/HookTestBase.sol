@@ -124,9 +124,18 @@ abstract contract HookTestBase is Test {
     }
 
     function _swap(bool zeroForOne, int256 amountSpecified, uint160 priceLimit) internal returns (BalanceDelta) {
-        if (priceLimit == 0) priceLimit = zeroForOne ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1;
+        return _swap(zeroForOne, amountSpecified, priceLimit, "");
+    }
+
+    function _swap(bool zeroForOne, int256 amountSpecified, uint160 priceLimit, bytes memory hookData)
+        internal
+        returns (BalanceDelta)
+    {
+        if (priceLimit == 0) {
+            priceLimit = zeroForOne ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1;
+        }
         return swapRouter.swap(
-            key, SwapParams(zeroForOne, amountSpecified, priceLimit), PoolSwapTest.TestSettings(false, false), ""
+            key, SwapParams(zeroForOne, amountSpecified, priceLimit), PoolSwapTest.TestSettings(false, false), hookData
         );
     }
 
@@ -136,6 +145,11 @@ abstract contract HookTestBase is Test {
 
     function _imdBalance(address who) internal view returns (uint256) {
         return IERC20Minimal(IMD).balanceOf(who);
+    }
+
+    /// @dev Refund the swap router holds: IMD transferred to it plus IMD ERC-6909 claims minted to it.
+    function _routerRefund() internal view returns (uint256) {
+        return _imdBalance(address(swapRouter)) + manager.balanceOf(address(swapRouter), IMD_ID);
     }
 
     function _imdDelta(BalanceDelta delta) internal view returns (int128) {

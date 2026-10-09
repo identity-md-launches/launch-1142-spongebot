@@ -7,7 +7,7 @@ import {Hooks} from "v4-core/src/libraries/Hooks.sol";
 import {LPFeeLibrary} from "v4-core/src/libraries/LPFeeLibrary.sol";
 import {PoolKey} from "v4-core/src/types/PoolKey.sol";
 import {PoolId} from "v4-core/src/types/PoolId.sol";
-import {Currency} from "v4-core/src/types/Currency.sol";
+import {Currency, CurrencyLibrary} from "v4-core/src/types/Currency.sol";
 import {SwapParams} from "v4-core/src/types/PoolOperation.sol";
 import {BalanceDelta} from "v4-core/src/types/BalanceDelta.sol";
 import {BeforeSwapDelta, BeforeSwapDeltaLibrary, toBeforeSwapDelta} from "v4-core/src/types/BeforeSwapDelta.sol";
@@ -25,11 +25,15 @@ import {SpongeBotVault} from "./SpongeBotVault.sol";
 /// `rate x the IMD amount that actually moved through the pool`:
 ///  - IMD on the unspecified side (exact-input sell, exact-output buy): taken in afterSwap from the real delta.
 ///  - IMD on the specified side (exact-input buy, exact-output sell): reserved in beforeSwap from the specified
-///    amount, then reconciled in afterSwap against the actual fill; the excess is refunded to the swapper as an
-///    IMD ERC-6909 claim, so a price-limited partial fill never pays more than the rate on what filled.
+///    amount, then reconciled in afterSwap against the actual fill; the excess is refunded, so a price-limited
+///    partial fill never pays more than the rate on what filled. The refund goes to the address encoded in
+///    `hookData` (`abi.encode(address)`), or to the PoolManager's caller (the router) when hookData is empty: as
+///    IMD transferred out of the PoolManager when its balance covers it, otherwise as an IMD ERC-6909 claim that
+///    `redeemRefund` turns into IMD at any later time.
 /// No owner, no setters, no proxies, no delegatecall, no selfdestruct.
 contract SpongeBotHook is IUnlockCallback {
     using BeforeSwapDeltaLibrary for BeforeSwapDelta;
+    using CurrencyLibrary for Currency;
 
     // ---------------------------------------------------------------------------------------------
     // Constants
@@ -51,8 +55,13 @@ contract SpongeBotHook is IUnlockCallback {
     // Transient slots (EIP-1153). Valid only within one transaction.
     // keccak256("SpongeBotHook.reservedFee")
     bytes32 internal constant RESERVED_FEE_SLOT = 0x28a3eb227cd5e3d321cddcf9ef2de698aa60d295fbd9bbcd7d28a7b3f15cd286;
-    // keccak256("SpongeBotHook.sweeping")
+    // keccak256("SpongeBotHook.sweeping"): the unlock this hook is running (0 none, UNLOCK_SWEEP, UNLOCK_REDEEM).
     bytes32 internal constant SWEEPING_SLOT = 0x816ae5434e0ef23ea59e1986d3a780ad61c76d05bb37a8b13b609af0dceb2f1a;
+    uint256 internal constant UNLOCK_SWEEP = 1;
+    uint256 internal constant UNLOCK_REDEEM = 2;
+    // The PoolManager's transient slot holding the currency it last synced (CurrencyReserves.CURRENCY_SLOT).
+    bytes32 internal constant MANAGER_SYNCED_CURRENCY_SLOT =
+        0x27e098c505d44ec3574004bca052aabf76bd35004c182099d8c575fb238593b9;
 
     // ---------------------------------------------------------------------------------------------
     // Immutables
@@ -85,7 +94,9 @@ contract SpongeBotHook is IUnlockCallback {
 
     event PoolOpened(PoolId indexed id, uint256 openBlock);
     event FeeAccrued(uint256 antiSnipe, uint256 staking, uint256 refunded);
+    event Refunded(address indexed to, uint256 amount, bool asClaim);
     event Swept(uint256 antiSnipe, uint256 staking);
+    event RefundRedeemed(address indexed holder, uint256 amount);
 
     error NotPoolManager();
     error AlreadyInitialized();
@@ -95,6 +106,7 @@ contract SpongeBotHook is IUnlockCallback {
     error NothingToSweep();
     error NotSweeping();
     error ZeroAddress();
+    error ZeroAmount();
 
     modifier onlyPoolManager() {
         if (msg.sender != address(poolManager)) revert NotPoolManager();
@@ -204,11 +216,15 @@ contract SpongeBotHook is IUnlockCallback {
     }
 
     /// @notice Settles the fee against what actually filled.
-    function afterSwap(address sender, PoolKey calldata, SwapParams calldata params, BalanceDelta delta, bytes calldata)
-        external
-        onlyPoolManager
-        returns (bytes4, int128)
-    {
+    /// @dev `hookData` may carry `abi.encode(address)`: the address any specified-side refund is sent to. Without
+    /// it the refund goes to `sender`, the PoolManager's caller.
+    function afterSwap(
+        address sender,
+        PoolKey calldata,
+        SwapParams calldata params,
+        BalanceDelta delta,
+        bytes calldata hookData
+    ) external onlyPoolManager returns (bytes4, int128) {
         int128 pairedDelta = pairedIsCurrency0 ? delta.amount0() : delta.amount1();
         uint256 pairedAmount = pairedDelta < 0 ? uint256(uint128(-pairedDelta)) : uint256(uint128(pairedDelta));
         uint256 rate = feeBps();
@@ -221,7 +237,7 @@ contract SpongeBotHook is IUnlockCallback {
             _tstore(RESERVED_FEE_SLOT, 0);
             if (fee > reserved) fee = reserved;
             refund = reserved - fee;
-            if (refund > 0) poolManager.mint(sender, _pairedId(), refund);
+            if (refund > 0) _refund(_refundRecipient(sender, hookData), refund);
         } else {
             hookDeltaUnspecified = int128(uint128(fee));
         }
@@ -250,22 +266,41 @@ contract SpongeBotHook is IUnlockCallback {
         if (antiSnipe + staking == 0) revert NothingToSweep();
         pendingAntiSnipe = 0;
         pendingStaking = 0;
-        _tstore(SWEEPING_SLOT, 1);
-        poolManager.unlock(abi.encode(antiSnipe, staking));
+        _tstore(SWEEPING_SLOT, UNLOCK_SWEEP);
+        poolManager.unlock(abi.encode(antiSnipe, staking, address(0)));
         _tstore(SWEEPING_SLOT, 0);
         emit Swept(antiSnipe, staking);
     }
 
+    /// @notice Turns `amount` of the caller's IMD ERC-6909 claims (a refund minted while the PoolManager could not
+    /// cover it in IMD) into IMD sent to the caller. The caller must first allow this hook to burn its claims:
+    /// `poolManager.setOperator(hook, true)` or `poolManager.approve(hook, IMD id, amount)`.
+    function redeemRefund(uint256 amount) external {
+        if (amount == 0) revert ZeroAmount();
+        _tstore(SWEEPING_SLOT, UNLOCK_REDEEM);
+        poolManager.unlock(abi.encode(amount, uint256(0), msg.sender));
+        _tstore(SWEEPING_SLOT, 0);
+        emit RefundRedeemed(msg.sender, amount);
+    }
+
     /// @inheritdoc IUnlockCallback
     function unlockCallback(bytes calldata data) external onlyPoolManager returns (bytes memory) {
-        if (_tload(SWEEPING_SLOT) != 1) revert NotSweeping();
-        (uint256 antiSnipe, uint256 staking) = abi.decode(data, (uint256, uint256));
+        uint256 action = _tload(SWEEPING_SLOT);
         Currency paired = Currency.wrap(PAIRED_CURRENCY);
-        poolManager.burn(address(this), _pairedId(), antiSnipe + staking);
-        if (antiSnipe > 0) poolManager.take(paired, HACKATHON_VAULT, antiSnipe);
-        if (staking > 0) {
-            poolManager.take(paired, address(vault), staking);
-            vault.notifyReward(staking);
+        if (action == UNLOCK_SWEEP) {
+            (uint256 antiSnipe, uint256 staking,) = abi.decode(data, (uint256, uint256, address));
+            poolManager.burn(address(this), _pairedId(), antiSnipe + staking);
+            if (antiSnipe > 0) poolManager.take(paired, HACKATHON_VAULT, antiSnipe);
+            if (staking > 0) {
+                poolManager.take(paired, address(vault), staking);
+                vault.notifyReward(staking);
+            }
+        } else if (action == UNLOCK_REDEEM) {
+            (uint256 amount,, address holder) = abi.decode(data, (uint256, uint256, address));
+            poolManager.burn(holder, _pairedId(), amount);
+            poolManager.take(paired, holder, amount);
+        } else {
+            revert NotSweeping();
         }
         return "";
     }
@@ -284,10 +319,36 @@ contract SpongeBotHook is IUnlockCallback {
         return uint256(uint160(PAIRED_CURRENCY));
     }
 
+    /// @dev The address a refund goes to: `abi.encode(address)` in hookData, else the PoolManager's caller.
+    function _refundRecipient(address sender, bytes calldata hookData) internal pure returns (address to) {
+        if (hookData.length == 32) {
+            // Low 160 bits of the word; never reverts on malformed data (a swap must not fail over hookData).
+            to = address(uint160(uint256(bytes32(hookData))));
+            if (to != address(0)) return to;
+        }
+        return sender;
+    }
+
+    /// @dev Pays `amount` of IMD the hook is owed back to `to`: transferred out of the PoolManager when the manager
+    /// holds enough IMD and has not synced IMD for a pending settlement (a transfer then would corrupt the
+    /// caller's settle), otherwise minted to `to` as an IMD ERC-6909 claim redeemable through `redeemRefund`.
+    function _refund(address to, uint256 amount) internal {
+        Currency paired = Currency.wrap(PAIRED_CURRENCY);
+        bool synced = address(uint160(uint256(poolManager.exttload(MANAGER_SYNCED_CURRENCY_SLOT)))) == PAIRED_CURRENCY;
+        if (!synced && paired.balanceOf(address(poolManager)) >= amount) {
+            poolManager.take(paired, to, amount);
+            emit Refunded(to, amount, false);
+        } else {
+            poolManager.mint(to, _pairedId(), amount);
+            emit Refunded(to, amount, true);
+        }
+    }
+
     /// @dev ceil(a * b / d) with an explicit overflow check that reverts with UnrepresentableFee.
     function _ceilMulDiv(uint256 a, uint256 b, uint256 d) internal pure returns (uint256) {
         if (b == 0 || a == 0) return 0;
-        if (a > type(uint256).max / b) revert UnrepresentableFee();
+        // `a * b` must fit together with the `d - 1` the ceiling adds.
+        if (a > (type(uint256).max - (d - 1)) / b) revert UnrepresentableFee();
         uint256 product = a * b;
         return (product + d - 1) / d;
     }

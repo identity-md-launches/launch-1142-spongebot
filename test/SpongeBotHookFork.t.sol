@@ -41,7 +41,7 @@ contract SpongeBotHookForkTest is HookTestBase {
         uint256 imdBefore = _imdBalance(address(this));
         _buy(-int256(amountIn), 0);
         uint256 fee = manager.balanceOf(address(hook), IMD_ID);
-        uint256 refund = manager.balanceOf(address(swapRouter), IMD_ID);
+        uint256 refund = _routerRefund();
         assertEq(imdBefore - _imdBalance(address(this)), amountIn);
         assertEq(fee, (amountIn - fee - refund) * rate / 10_000);
     }
@@ -73,7 +73,7 @@ contract SpongeBotHookForkTest is HookTestBase {
         uint256 received = _imdBalance(address(this)) - imdBefore;
         assertEq(received, 100 ether);
         uint256 fee = manager.balanceOf(address(hook), IMD_ID);
-        uint256 refund = manager.balanceOf(address(swapRouter), IMD_ID);
+        uint256 refund = _routerRefund();
         assertEq(fee, (received + fee + refund) * rate / 10_000);
     }
 
@@ -85,7 +85,7 @@ contract SpongeBotHookForkTest is HookTestBase {
         _buy(-10_000 ether, buyLimit);
         uint256 paid = imdBefore - _imdBalance(address(this));
         uint256 fee = manager.balanceOf(address(hook), IMD_ID);
-        uint256 refund = manager.balanceOf(address(swapRouter), IMD_ID);
+        uint256 refund = _routerRefund();
         assertEq(fee, (paid - fee - refund) * rate / 10_000);
         assertGt(refund, 0);
     }
@@ -98,6 +98,6 @@ contract SpongeBotHookForkTest is HookTestBase {
         hook.sweep();
         assertEq(_imdBalance(hook.HACKATHON_VAULT()) - hackBefore, anti);
         assertEq(_imdBalance(address(vault)), staking);
-        assertEq(vault.queuedRewards(), staking);
+        assertEq(vault.unstreamedRewards(), staking);
     }
 }
