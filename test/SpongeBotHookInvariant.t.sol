@@ -17,8 +17,8 @@ import {SpongeBotVault} from "../src/SpongeBotVault.sol";
 import {MockERC20} from "./mocks/MockERC20.sol";
 import {HookTestBase} from "./utils/HookTestBase.sol";
 
-/// @notice Drives the real PoolManager with random swaps of every kind, block advances, sweeps and staking, and
-/// records what every swap charged so the invariants can compare the hook's books with the chain's.
+/// @notice Drives the real PoolManager with random swaps of every kind, block advances, sweeps, claim redemptions
+/// and staking, and records what every swap charged so the invariants can compare the hook's books with the chain's.
 contract HookHandler is Test {
     using StateLibrary for IPoolManager;
 
@@ -42,12 +42,19 @@ contract HookHandler is Test {
     uint256 public antiSwept;
     uint256 public stakingSwept;
     uint256 public claimed;
+    uint256 public refundedAsImd;
+    uint256 public refundedAsClaim;
+    uint256 public redeemed;
     uint256 public maxDust;
     uint256 public violations;
     uint256 public swaps;
     uint256 public partialFills;
     uint256 public sweeps;
     uint256 public tokensGivenToActors;
+    /// @notice A plain address named in hookData as refund recipient on some swaps.
+    address public immutable refundSink;
+    mapping(address => uint256) otherImd;
+    mapping(address => uint256) otherClaims;
 
     constructor(
         IPoolManager manager_,
@@ -71,6 +78,9 @@ contract HookHandler is Test {
         actors = actors_;
         token.approve(address(router), type(uint256).max);
         IERC20Minimal(imd).approve(address(router), type(uint256).max);
+        refundSink = makeAddr("refundSink");
+        vm.prank(refundSink);
+        manager.setOperator(address(hook), true);
         for (uint256 i = 0; i < actors_.length; i++) {
             vm.prank(actors_[i]);
             token.approve(address(vault), type(uint256).max);
@@ -87,7 +97,8 @@ contract HookHandler is Test {
 
     /// @param mode 0 exact-input buy, 1 exact-output buy, 2 exact-input sell, 3 exact-output sell
     /// @param limitBps 0 for no limit, else stop after this many bps of sqrt-price movement
-    function swap(uint256 amount, uint8 mode, uint16 limitBps) external {
+    /// @param toSink whether the swap names the refund sink in hookData as the refund recipient
+    function swap(uint256 amount, uint8 mode, uint16 limitBps, bool toSink) external {
         amount = bound(amount, 1e9, 2_000 ether);
         mode %= 4;
         bool isBuy = mode < 2;
@@ -111,7 +122,9 @@ contract HookHandler is Test {
         uint256 rate = hook.feeBps();
         int256 walletBefore = int256(IERC20Minimal(imd).balanceOf(address(this)));
         uint256 hookClaimsBefore = manager.balanceOf(address(hook), imdId);
-        uint256 routerClaimsBefore = manager.balanceOf(address(router), imdId);
+        address to = toSink ? refundSink : address(router);
+        uint256 toImdBefore = IERC20Minimal(imd).balanceOf(to);
+        uint256 toClaimsBefore = manager.balanceOf(to, imdId);
         uint256 antiBefore = hook.pendingAntiSnipe();
         uint256 stakingBefore = hook.pendingStaking();
 
@@ -119,11 +132,13 @@ contract HookHandler is Test {
             key,
             SwapParams(zeroForOne, exactIn ? -int256(amount) : int256(amount), limit),
             PoolSwapTest.TestSettings(false, false),
-            ""
+            toSink ? abi.encode(refundSink) : bytes("")
         );
 
         uint256 fee = manager.balanceOf(address(hook), imdId) - hookClaimsBefore;
-        uint256 refund = manager.balanceOf(address(router), imdId) - routerClaimsBefore;
+        uint256 refundImd = IERC20Minimal(imd).balanceOf(to) - toImdBefore;
+        uint256 refundClaim = manager.balanceOf(to, imdId) - toClaimsBefore;
+        uint256 refund = refundImd + refundClaim;
         int256 walletChange = int256(IERC20Minimal(imd).balanceOf(address(this))) - walletBefore;
         int256 poolImdSigned = isBuy ? -walletChange - int256(fee + refund) : walletChange + int256(fee + refund);
         if (poolImdSigned < 0) {
@@ -138,14 +153,50 @@ contract HookHandler is Test {
         if (!pairedSpecified && refund != 0) violations++;
         if (cut == 0 && pairedSpecified && refund > 2) violations++;
         if (refund > 2) partialFills++;
+        // The other recipient must not have received anything.
+        address other = toSink ? address(router) : refundSink;
+        if (
+            IERC20Minimal(imd).balanceOf(other) != otherImd[other]
+                || manager.balanceOf(other, imdId) != otherClaims[other]
+        ) {
+            violations++;
+        }
+        otherImd[to] = IERC20Minimal(imd).balanceOf(to);
+        otherClaims[to] = manager.balanceOf(to, imdId);
+        refundedAsImd += refundImd;
+        refundedAsClaim += refundClaim;
 
         totalFeeAccrued += fee;
         totalPoolImd += poolImd;
         swaps++;
     }
 
-    function roll(uint8 blocks) external {
+    /// @dev The sink turns part of any IMD claim it holds (a refund the manager could not cover) back into IMD.
+    function redeem(uint256 part) external {
+        uint256 held = manager.balanceOf(refundSink, imdId);
+        if (held == 0) {
+            vm.prank(refundSink);
+            (bool ok,) = address(hook).call(abi.encodeCall(SpongeBotHook.redeemRefund, (1)));
+            if (ok) violations++;
+            return;
+        }
+        uint256 amount = bound(part, 1, held);
+        uint256 before = IERC20Minimal(imd).balanceOf(refundSink);
+        vm.prank(refundSink);
+        hook.redeemRefund(amount);
+        if (IERC20Minimal(imd).balanceOf(refundSink) - before != amount) violations++;
+        if (manager.balanceOf(refundSink, imdId) != held - amount) violations++;
+        otherImd[refundSink] = IERC20Minimal(imd).balanceOf(refundSink);
+        otherClaims[refundSink] = held - amount;
+        redeemed += amount;
+    }
+
+    function roll(uint16 blocks) external {
         vm.roll(vm.getBlockNumber() + bound(uint256(blocks), 1, 4));
+    }
+
+    function rollFar(uint16 blocks) external {
+        vm.roll(vm.getBlockNumber() + bound(uint256(blocks), 1, 2 * vault.REWARD_DURATION()));
     }
 
     function sweep(uint256 seed) external {
@@ -157,37 +208,30 @@ contract HookHandler is Test {
             if (ok) violations++;
             return;
         }
-        uint256 pointsTotal = vault.currentTotalPoints();
-        uint256 epochBefore = vault.currentEpoch();
-        uint256 total = staking + vault.queuedRewards();
+        uint256 unstreamedBefore = vault.unstreamedRewards();
+        uint256 streamEndBefore = vault.streamEnd();
         vm.prank(_actor(seed));
         hook.sweep();
         antiSwept += anti;
         stakingSwept += staking;
         sweeps++;
         if (staking > 0) {
-            // Replay the vault's own arithmetic: no stake-blocks queues everything; otherwise the epoch closes and
-            // only the part the floored rate cannot represent is re-queued.
-            if (pointsTotal == 0) {
-                if (vault.queuedRewards() != total) violations++;
-                if (vault.currentEpoch() != epochBefore) violations++;
-            } else {
-                uint256 rate = total * 1e18 / pointsTotal;
-                uint256 distributed = (rate * pointsTotal + 1e18 - 1) / 1e18;
-                if (vault.queuedRewards() != total - distributed) violations++;
-                if (vault.currentEpoch() != epochBefore + 1) violations++;
-                maxDust += 1;
-            }
-        } else if (vault.currentEpoch() != epochBefore) {
+            // The vault folds what was still unstreamed into a fresh full window with the new amount.
+            uint256 unstreamed = vault.unstreamedRewards();
+            if (unstreamed > unstreamedBefore + staking) violations++;
+            if (unstreamed + 2 < unstreamedBefore + staking) violations++;
+            if (vault.streamEnd() != block.number + vault.REWARD_DURATION()) violations++;
+            maxDust += 2;
+        } else if (vault.streamEnd() != streamEndBefore) {
             violations++; // nothing notified: the vault must not have been touched
         }
         if (hook.pending() != 0) violations++;
     }
 
-    /// @dev The reopened finding through the real hook: stake, sweep and exit in one block earns nothing.
+    /// @dev Stake, sweep and exit in one block through the real hook: earns nothing from that sweep.
     function flashStakeAroundSweep(uint256 seed, uint256 amount) external {
         address who = _actor(seed);
-        if (vault.stakedBalance(who) != 0 || vault.points(who) != 0) return;
+        if (vault.stakedBalance(who) != 0) return;
         if (hook.pendingStaking() == 0) return;
         amount = bound(amount, 1, 50_000 ether);
         if (token.balanceOf(address(this)) < amount + 1_000_000 ether) return;
@@ -237,7 +281,7 @@ contract HookHandler is Test {
     }
 }
 
-/// @notice Invariants over random swap / roll / sweep / stake sequences on a fresh PoolManager.
+/// @notice Invariants over random swap / roll / sweep / redeem / stake sequences on a fresh PoolManager.
 contract SpongeBotHookInvariantTest is HookTestBase {
     HookHandler handler;
     address[] actors;
@@ -295,6 +339,11 @@ contract SpongeBotHookInvariantTest is HookTestBase {
         assertEq(
             _imdBalance(address(vault)), handler.stakingSwept() - handler.claimed(), "vault got exactly the staking fee"
         );
+        assertEq(
+            _imdBalance(address(swapRouter)) + _imdBalance(handler.refundSink()) - handler.redeemed(),
+            handler.refundedAsImd(),
+            "IMD refunds all landed on their recipient"
+        );
         // The hook charged at most the opening rate on everything that moved through the pool.
         assertLe(handler.totalFeeAccrued(), handler.totalPoolImd() * 3_100 / 10_000 + handler.swaps());
     }
@@ -306,12 +355,19 @@ contract SpongeBotHookInvariantTest is HookTestBase {
         assertEq(_imdBalance(address(hook)), 0);
         assertEq(token.balanceOf(address(hook)), 0);
         uint256 claims = manager.balanceOf(address(hook), IMD_ID) + manager.balanceOf(address(swapRouter), IMD_ID)
-            + manager.balanceOf(address(handler), IMD_ID);
+            + manager.balanceOf(handler.refundSink(), IMD_ID);
         assertGe(_imdBalance(address(manager)), claims, "manager holds the IMD behind every claim");
-        // IMD never leaves the system: every unit minted is in a wallet, the manager, or a vault.
+        assertEq(
+            manager.balanceOf(address(swapRouter), IMD_ID) + manager.balanceOf(handler.refundSink(), IMD_ID)
+                + handler.redeemed(),
+            handler.refundedAsClaim(),
+            "every claim refund is still held or was redeemed"
+        );
+        // IMD never leaves the system: every unit minted is in a wallet, the router, the manager, or a vault.
         uint256 supply = MockERC20(IMD).totalSupply();
         uint256 located = _imdBalance(address(this)) + _imdBalance(address(handler)) + _imdBalance(address(manager))
-            + _imdBalance(hook.HACKATHON_VAULT()) + _imdBalance(address(vault)) + _sumActorImd();
+            + _imdBalance(address(swapRouter)) + _imdBalance(handler.refundSink()) + _imdBalance(hook.HACKATHON_VAULT())
+            + _imdBalance(address(vault)) + _sumActorImd();
         assertEq(located, supply, "IMD conservation");
     }
 
@@ -319,11 +375,14 @@ contract SpongeBotHookInvariantTest is HookTestBase {
     /// forge-config: default.invariant.depth = 40
     /// forge-config: default.invariant.fail-on-revert = true
     function invariant_vaultOwesNoMoreThanItHolds() public view {
-        uint256 owed = _sumEarned() + vault.queuedRewards();
+        uint256 owed = _sumEarned() + vault.unstreamedRewards();
         assertGe(_imdBalance(address(vault)), owed);
-        assertLe(handler.stakingSwept() - handler.claimed() - owed, handler.maxDust(), "only rounding dust unassigned");
+        assertLe(
+            handler.stakingSwept() - handler.claimed() - owed, handler.maxDust() + 8, "only rounding dust unassigned"
+        );
         assertEq(token.balanceOf(address(vault)), vault.totalStaked());
         assertEq(token.totalSupply(), 1e27);
+        assertLe(vault.remainingStreamBlocks(), vault.REWARD_DURATION());
     }
 
     /// forge-config: default.invariant.runs = 48

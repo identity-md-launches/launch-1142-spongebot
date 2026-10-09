@@ -106,7 +106,7 @@ contract SpongeBotHookForkTest is HookTestBase {
         hook.sweep();
         assertEq(_imdBalance(hook.HACKATHON_VAULT()) - hackBefore, anti);
         assertEq(_imdBalance(address(vault)), staking);
-        assertEq(vault.unstreamedRewards(), staking);
+        assertApproxEqAbs(vault.unstreamedRewards(), staking, 1, "all still to stream, minus the rate's floor");
     }
 
     function test_fork_permissionBitsAcceptedByTheRealManager() public view {
@@ -124,23 +124,30 @@ contract SpongeBotHookForkTest is HookTestBase {
         _sell(int256(10_000 ether), limit);
         uint256 received = _imdBalance(address(this)) - imdBefore;
         uint256 fee = manager.balanceOf(address(hook), IMD_ID);
-        uint256 refund = manager.balanceOf(address(swapRouter), IMD_ID);
+        uint256 refund = _routerRefund();
         assertEq(fee, (received + fee + refund) * rate / 10_000);
         assertGt(refund, 0);
+        assertEq(manager.balanceOf(address(swapRouter), IMD_ID), 0, "the funded manager refunds in real IMD");
     }
 
-    function test_fork_selfRoutingSwapperRedeemsRefundInRealImd() public {
+    /// @notice A self-routing swapper on the real manager, which holds IMD: the partial-fill refund comes back as
+    /// real IMD in the swapper's own balance, no claim is minted and there is nothing to redeem.
+    function test_fork_selfRoutingSwapperGetsRefundAsRealImd() public {
+        uint256 rate = hook.feeBps();
         ClaimRouter router = new ClaimRouter(manager);
         router.setUseClaims(false);
         IERC20Minimal(IMD).transfer(address(router), 10_000 ether);
         uint160 price = _sqrtPrice();
         uint160 limit = imdIsCurrency0 ? price - price / 10_000 : price + price / 10_000;
         router.swap(key, SwapParams(imdIsCurrency0, -int256(uint256(10_000 ether)), limit));
-        uint256 refund = manager.balanceOf(address(router), IMD_ID);
-        assertGt(refund, 0);
+        uint256 refund = _imdBalance(address(router));
+        uint256 fee = manager.balanceOf(address(hook), IMD_ID);
+        assertGt(refund, fee, "most of the reservation came back, as IMD");
+        assertEq(manager.balanceOf(address(router), IMD_ID), 0, "no claim on a funded manager");
+        assertEq(fee, (10_000 ether - refund - fee) * rate / 10_000, "fee on what filled only");
         uint256 before = _imdBalance(address(this));
-        router.redeem(Currency.wrap(IMD));
-        assertEq(_imdBalance(address(this)) - before, refund);
+        assertEq(router.redeem(Currency.wrap(IMD)), 0, "nothing to redeem");
+        assertEq(_imdBalance(address(this)), before);
     }
 
     function test_fork_stakersGetRealImdAfterSweep() public {
@@ -150,9 +157,14 @@ contract SpongeBotHookForkTest is HookTestBase {
         token.approve(address(vault), type(uint256).max);
         vault.stake(100 ether);
         vm.stopPrank();
+        vm.roll(vm.getBlockNumber() + 1);
         _sell(-1_000 ether, 0);
         uint256 staking = hook.pendingStaking();
         hook.sweep();
+        // The vault streams every distribution over REWARD_DURATION blocks and pays nothing in the sweep block.
+        assertEq(vault.earned(alice), 0, "nothing is paid in the sweep block");
+        assertApproxEqAbs(vault.unstreamedRewards(), staking, 1);
+        vm.roll(vm.getBlockNumber() + vault.REWARD_DURATION());
         vm.prank(alice);
         uint256 paid = vault.claim();
         assertApproxEqAbs(paid, staking, 100);

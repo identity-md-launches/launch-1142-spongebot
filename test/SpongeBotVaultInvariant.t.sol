@@ -7,13 +7,14 @@ import {SpongeBotVault} from "../src/SpongeBotVault.sol";
 import {MockERC20} from "./mocks/MockERC20.sol";
 
 /// @notice Random stake / unstake / claim / exit / notify / donate / roll / flash-stake sequences from several actors,
-/// with the handler standing in for the hook and keeping an exact model of the vault's queue.
+/// with the handler standing in for the hook and checking per-call properties of the streaming accumulator.
 contract VaultHandler is Test {
-    uint256 constant PRECISION = 1e18;
+    uint256 constant PRECISION = 1e30;
 
     SPONGEBOT public immutable token;
     MockERC20 public immutable imd;
     SpongeBotVault public immutable vault;
+    uint256 public immutable DURATION;
     address[] public actors;
 
     // Ghost accounting
@@ -22,17 +23,17 @@ contract VaultHandler is Test {
     uint256 public totalClaimed;
     uint256 public distributions;
     uint256 public settlements;
-    uint256 public expectedQueued;
-    uint256 public lastEpoch;
-    uint256 public lastCumulativeRate;
+    uint256 public lastRewardPerToken;
     uint256 public violations;
     uint256 public calls;
     mapping(address => uint256) public netStaked;
+    mapping(address => uint256) public lastEarned;
 
     constructor(SPONGEBOT token_, MockERC20 imd_, SpongeBotVault vault_, address[] memory actors_) {
         token = token_;
         imd = imd_;
         vault = vault_;
+        DURATION = vault_.REWARD_DURATION();
         actors = actors_;
         for (uint256 i = 0; i < actors_.length; i++) {
             vm.prank(actors_[i]);
@@ -48,24 +49,27 @@ contract VaultHandler is Test {
         return actors[seed % actors.length];
     }
 
-    function _cumulativeRate() internal view returns (uint256 cumulative) {
-        (, cumulative,) = vault.epochs(vault.currentEpoch());
-    }
-
+    /// @dev Properties that hold after every call: the accumulator never goes back, nobody's earned amount ever
+    /// drops except through a payout, and the stream end never sits in the past while something is staked and
+    /// unstreamed.
     function _track() internal {
         calls++;
-        uint256 epoch = vault.currentEpoch();
-        uint256 cumulative = _cumulativeRate();
-        if (epoch < lastEpoch) violations++;
-        if (cumulative < lastCumulativeRate) violations++;
-        if (vault.queuedRewards() != expectedQueued) violations++;
+        uint256 rpt = vault.rewardPerToken();
+        if (rpt < lastRewardPerToken) violations++;
+        lastRewardPerToken = rpt;
         if (vault.lastUpdateBlock() > block.number) violations++;
-        lastEpoch = epoch;
-        lastCumulativeRate = cumulative;
+        for (uint256 i = 0; i < actors.length; i++) {
+            uint256 e = vault.earned(actors[i]);
+            if (e < lastEarned[actors[i]]) violations++;
+            lastEarned[actors[i]] = e;
+        }
+        if (vault.totalStaked() == 0 && vault.unstreamedRewards() > 0) {
+            if (vault.streamEnd() <= vault.lastUpdateBlock()) violations++;
+        }
     }
 
-    function roll(uint8 blocks) external {
-        vm.roll(vm.getBlockNumber() + bound(uint256(blocks), 1, 20));
+    function roll(uint16 blocks) external {
+        vm.roll(vm.getBlockNumber() + bound(uint256(blocks), 1, 2 * DURATION));
         _track();
     }
 
@@ -89,11 +93,9 @@ contract VaultHandler is Test {
         if (staked == 0) return;
         amount = bound(amount, 1, staked);
         uint256 earnedBefore = vault.earned(who);
-        uint256 pointsBefore = vault.points(who);
         vm.prank(who);
         vault.unstake(amount);
         if (vault.earned(who) != earnedBefore) violations++; // unstaking keeps earned rewards
-        if (vault.points(who) != pointsBefore) violations++; // and the stake-blocks accrued so far
         netStaked[who] -= amount;
         settlements++;
         _track();
@@ -108,6 +110,7 @@ contract VaultHandler is Test {
         if (paid != expected || imd.balanceOf(who) - before != paid) violations++;
         if (vault.earned(who) != 0) violations++;
         totalClaimed += paid;
+        lastEarned[who] = 0;
         settlements++;
         _track();
     }
@@ -125,37 +128,38 @@ contract VaultHandler is Test {
         if (vault.stakedBalance(who) != 0 || vault.earned(who) != 0) violations++;
         totalClaimed += expected;
         netStaked[who] = 0;
+        lastEarned[who] = 0;
         settlements += 2;
         _track();
     }
 
-    /// @dev What the hook does in sweep(): transfer, then notify. Replays the vault's own arithmetic on the model.
+    /// @dev What the hook does in sweep(): transfer, then notify. A notification folds the unstreamed rest into a
+    /// fresh full window, pays nothing in its own block and changes nobody's earned amount.
     function notify(uint256 amount) external {
         amount = bound(amount, 0, 100_000 ether);
         imd.mint(address(vault), amount);
-        uint256 pointsTotal = vault.currentTotalPoints();
-        uint256 epochBefore = vault.currentEpoch();
-        uint256 total = amount + expectedQueued;
+        uint256 unstreamedBefore = vault.unstreamedRewards();
+        uint256[] memory earnedBefore = new uint256[](actors.length);
+        for (uint256 i = 0; i < actors.length; i++) {
+            earnedBefore[i] = vault.earned(actors[i]);
+        }
         vault.notifyReward(amount);
         totalNotified += amount;
-        if (pointsTotal == 0) {
-            expectedQueued = total;
-            if (vault.currentEpoch() != epochBefore) violations++;
-        } else {
-            uint256 rate = total * PRECISION / pointsTotal;
-            uint256 distributed = (rate * pointsTotal + PRECISION - 1) / PRECISION;
-            expectedQueued = total - distributed;
-            distributions++;
-            if (vault.currentEpoch() != epochBefore + 1) violations++;
-            if (vault.currentTotalPoints() != 0) violations++;
+        distributions++;
+        if (vault.streamEnd() != block.number + DURATION) violations++;
+        uint256 unstreamed = vault.unstreamedRewards();
+        if (unstreamed > unstreamedBefore + amount) violations++;
+        if (unstreamed + 2 < unstreamedBefore + amount) violations++;
+        for (uint256 i = 0; i < actors.length; i++) {
+            if (vault.earned(actors[i]) != earnedBefore[i]) violations++;
         }
         _track();
     }
 
-    /// @dev Stake, notify and exit in one block from an account with no open-epoch stake-blocks: must earn nothing.
+    /// @dev Stake, notify and exit in one block: must earn nothing from this distribution.
     function flashStake(uint256 seed, uint256 amount, uint256 reward) external {
         address who = _actor(seed);
-        if (vault.stakedBalance(who) != 0 || vault.points(who) != 0) return;
+        if (vault.stakedBalance(who) != 0) return;
         amount = bound(amount, 1, 10_000 ether);
         if (token.balanceOf(address(this)) < amount) return;
         reward = bound(reward, 0, 100_000 ether);
@@ -171,6 +175,7 @@ contract VaultHandler is Test {
         if (imd.balanceOf(who) - imdBefore != owedBefore) violations++; // nothing from this distribution
         if (token.balanceOf(who) < amount) violations++;
         totalClaimed += owedBefore;
+        lastEarned[who] = 0;
         settlements += 3;
         _track();
     }
@@ -241,12 +246,6 @@ contract SpongeBotVaultInvariantTest is Test {
         }
     }
 
-    function _sumPoints() internal view returns (uint256 total) {
-        for (uint256 i = 0; i < actors.length; i++) {
-            total += vault.points(actors[i]);
-        }
-    }
-
     /// forge-config: default.invariant.runs = 128
     /// forge-config: default.invariant.depth = 50
     /// forge-config: default.invariant.fail-on-revert = true
@@ -263,16 +262,17 @@ contract SpongeBotVaultInvariantTest is Test {
     /// forge-config: default.invariant.depth = 50
     /// forge-config: default.invariant.fail-on-revert = true
     function invariant_rewardsAreConservedUpToRoundingDust() public view {
-        uint256 owed = _sumEarned() + vault.queuedRewards();
+        uint256 owed = _sumEarned() + vault.unstreamedRewards();
         uint256 inVault = imd.balanceOf(address(vault));
         assertGe(inVault, owed, "vault can always pay what it owes");
         assertEq(inVault, handler.totalNotified() + handler.totalDonated() - handler.totalClaimed(), "balance ledger");
         uint256 accounted = owed + handler.totalClaimed();
         assertLe(accounted, handler.totalNotified(), "never owes more than was notified");
-        // One wei per distribution (the ceiling of the booked amount) plus one wei per settlement (each floors).
+        // The rate floors once per distribution, the accumulator once per settlement and `earned` once per actor;
+        // every floor loses under one wei at these stakes.
         assertLe(
             handler.totalNotified() - accounted,
-            handler.distributions() + handler.settlements(),
+            handler.distributions() + handler.settlements() + actors.length + 2,
             "only rounding dust is lost"
         );
     }
@@ -280,10 +280,11 @@ contract SpongeBotVaultInvariantTest is Test {
     /// forge-config: default.invariant.runs = 128
     /// forge-config: default.invariant.depth = 50
     /// forge-config: default.invariant.fail-on-revert = true
-    function invariant_stakeBlocksSumAcrossStakers() public view {
-        // The open epoch's total stake-blocks are exactly the sum of every staker's, so nobody is weighted twice.
-        assertEq(_sumPoints(), vault.currentTotalPoints(), "stake-blocks sum");
-        assertEq(vault.queuedRewards(), handler.expectedQueued(), "queue matches the model");
+    function invariant_streamNeverRunsAheadOfTheClock() public view {
+        // Whatever is unstreamed is paid over at most one full window from the last update.
+        assertLe(vault.remainingStreamBlocks(), vault.REWARD_DURATION());
+        if (vault.rewardRate() == 0) assertEq(vault.unstreamedRewards(), 0);
+        assertLe(vault.unstreamedRewards(), handler.totalNotified() - handler.totalClaimed());
     }
 
     /// forge-config: default.invariant.runs = 128
