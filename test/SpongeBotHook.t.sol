@@ -408,11 +408,43 @@ contract SpongeBotHookTest is HookTestBase {
         uint256 staking = hook.pendingStaking();
         hook.sweep();
 
-        // Accumulator rounding loses at most totalStaked / 1e18 wei per distribution.
-        assertApproxEqAbs(vault.earned(alice), staking, 100);
+        // Alice has 100 x 10 = 1000e18 stake-blocks; the rate's remainder (under 1000 wei) is queued, not lost.
+        uint256 queued = vault.queuedRewards();
+        assertLe(queued, 1_000);
+        assertApproxEqAbs(vault.earned(alice) + queued, staking, 1);
         vm.prank(alice);
         vault.claim();
-        assertApproxEqAbs(_imdBalance(alice), staking, 100);
+        assertApproxEqAbs(_imdBalance(alice) + queued, staking, 1);
+    }
+
+    /// @notice The reopened finding: staking in the sweep's block earns nothing from it; stake-time earns.
+    function test_flashStakeAroundSweepEarnsNothing() public {
+        address alice = makeAddr("alice");
+        address bot = makeAddr("bot");
+        token.transfer(alice, 100 ether);
+        token.transfer(bot, 9_900 ether);
+        vm.startPrank(alice);
+        token.approve(address(vault), type(uint256).max);
+        vault.stake(100 ether);
+        vm.stopPrank();
+
+        vm.roll(hook.poolOpenBlock() + 10);
+        _buy(-1_000 ether, 0);
+        uint256 staking = hook.pendingStaking();
+        vm.roll(block.number + 100);
+
+        // Stake, sweep, exit, all in one block.
+        vm.startPrank(bot);
+        token.approve(address(vault), type(uint256).max);
+        vault.stake(9_900 ether);
+        hook.sweep();
+        vault.exit();
+        vm.stopPrank();
+
+        assertEq(_imdBalance(bot), 0, "zero blocks of stake earns nothing");
+        assertEq(token.balanceOf(bot), 9_900 ether);
+        assertApproxEqAbs(vault.earned(alice) + vault.queuedRewards(), staking, 1);
+        assertGt(vault.earned(alice), staking * 99 / 100);
     }
 
     function test_sweepRevertsWhenNothingPending() public {

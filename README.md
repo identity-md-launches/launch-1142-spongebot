@@ -81,23 +81,54 @@ is smaller than the reservation (fill < `rate / (10000 − rate)` of the request
 the request at the 31% opening rate, under 1% afterwards) leaves the swapper's IMD delta in the
 PoolManager slightly negative and an IMD claim larger than that; the net is still fill minus fee. A
 router that settles every negative delta (as the v4 test router does) completes the swap; a router
-that only settles its input currency would revert. `test_sellExactOutputTinyFillNetsToFillMinusFee`
-pins this behaviour down.
+that insists on a positive output delta (Universal Router `TAKE_ALL`, `V4Router._getFullCredit`)
+reverts with `DeltaNotPositive`. The hook cannot change the swapper's specified-side delta after the
+fill, so this is inherent to the reserve-and-refund design the brief mandates.
+`test_sellExactOutputTinyFillNetsToFillMinusFee` pins this behaviour down. **Integrators:** during
+the anti-snipe window use exact-input sells, or price limits that allow a full fill.
 
 **Refund recipient.** The refund claim is minted to the `sender` the PoolManager reports, i.e. the
-router that called `swap`. Routers that pass `takeClaims` / claim-aware settlement receive it
-directly; others accumulate it on the router contract. On full fills the refund is at most 2 wei of
-rounding dust.
+router that called `swap`; it is the only identity a hook can see. Routers that pass `takeClaims` /
+claim-aware settlement receive it directly (the v4 test router used in the tests holds it and can
+burn it in the same settlement); routers that never burn or transfer ERC-6909 claims (Universal Router,
+`V4Router`) strand it on the router contract. On full fills the refund is at most 2 wei of rounding
+dust; it only matters on a price-limited or liquidity-exhausted exact-input buy or exact-output sell
+(about 23.7% of the unfilled input in the opening block, 1% after block 10). **Integrators:** route
+such swaps through a claim-aware contract, or use limits that fill in full.
+
+**Sweep coupling.** One `sweep()` pays both recipients in one unlock. IMD is a plain ERC-20 that
+cannot reject a transfer, so neither leg can fail; if IMD ever gained a blocklist or pause that
+refused the hackathon vault, the staking leg would be blocked with it until the transfer succeeds.
 
 ## Staking vault
 
-`SpongeBotVault` uses the reward-per-token accumulator. `stake(amount)`, `unstake(amount)`,
-`claim()` and `exit()` are available at any time; only the staker can move the staker's tokens.
+`SpongeBotVault` uses a time-weighted reward-per-token accumulator: rewards are pro rata to
+**stake × blocks held**, not to stake alone. `stake(amount)`, `unstake(amount)`, `claim()` and
+`exit()` are available at any time; only the staker can move the staker's tokens.
 `notifyReward(amount)` is callable only by the hook, after the hook has transferred `amount` IMD in.
-Rewards that arrive while `totalStaked == 0` are kept in `queuedRewards` and folded into the next
-distribution that has stakers. Views: `earned(address)`, `totalStaked()`, `stakedBalance(address)`,
-`queuedRewards()`. Accumulator rounding loses under `totalStaked / 1e18` wei per distribution; that
-dust stays in the vault.
+
+**Epochs.** The time between two distributions is an epoch. Every staker accrues *stake-blocks*
+(stake × blocks) inside the open epoch; `notifyReward` closes it and splits the reward (plus anything
+queued) over the stake-blocks accrued since the previous distribution, then opens the next epoch. A
+stake that exists for zero blocks around a distribution earns nothing from it, so the moment at
+which the anyone-callable `sweep()` triggers the distribution cannot be used to capture rewards with
+a flash stake: staking, sweeping and exiting in one block yields exactly zero. Stake held for one
+block out of a thousand earns one thousandth, and so on. Rewards that arrive while no stake-blocks
+have accrued (nothing staked, or everything staked in that very block) are kept in `queuedRewards`
+and folded into the next distribution that has some.
+
+Each epoch stores its start block, its reward rate per stake-block and the cumulative rate at its
+start, so a staker who never touches the vault across many distributions is settled lazily in O(1)
+on the next action. `earned(address)` returns what is claimable now, i.e. everything from closed
+epochs; the open epoch's share is known only when it closes. Views: `earned(address)`,
+`totalStaked()`, `stakedBalance(address)`, `points(address)` (stake-blocks in the open epoch),
+`currentTotalPoints()`, `currentEpoch()`, `epochs(uint256)`, `queuedRewards()`.
+
+**Rounding.** The rate floors, so under `stake-blocks / 1e18` wei of each distribution cannot be
+represented by it; that part is re-queued for the next distribution rather than lost. What stays
+unclaimable in the vault is under one wei per distribution plus one wei per staker per settlement.
+The booked amount is the ceiling of the exact distribution, so the queued remainder can never also
+be owed to a staker and claims never exceed the vault's balance.
 
 ## Deployment parameters
 
@@ -116,7 +147,7 @@ dust stays in the vault.
   (8192 + 128 + 64 + 8 + 4 = 8396). The constructor does not validate its own address; the deployer
   mines it, and `test_permissionBitsMatchAddress` plus the protected floor check it.
 - The hook's constructor deploys `SpongeBotVault(token, IMD, hook)`; it calls no existing contract
-  and requires no address to have code. Hook initcode is about 10.8 KB (EIP-3860 limit 49,152),
+  and requires no address to have code. Hook initcode is about 11.6 KB (EIP-3860 limit 49,152),
   runtime about 7 KB.
 - The constructor only rejects zero addresses; `$poolManager` and `$token` are the only two
   arguments.
@@ -188,11 +219,13 @@ There is nothing to configure: no owner, no setter. What someone has to do:
 
 ## Tests
 
-`forge test` runs 49 local tests plus a fork suite that skips without an RPC:
+`forge test` runs 62 local tests plus a fork suite that skips without an RPC:
 
 - `test/SPONGEBOT.t.sol` — supply, decimals, transfer, allowance, no admin or mint path.
-- `test/SpongeBotVault.t.sol` — stake/unstake/claim/exit, pro rata by stake and time, queued rewards,
-  access control, a conservation fuzz.
+- `test/SpongeBotVault.t.sol` — stake/unstake/claim/exit, pro rata by stake, by time and by both, a
+  flash stake around a distribution earning zero (fixed and fuzzed), one-block stakes earning their
+  one-block share, lazy settlement across many epochs, queued rewards, remainder re-queuing and
+  solvency, access control, a conservation fuzz.
 - `test/SpongeBotHook.t.sol` — permission bits vs. address, callbacks refuse non-manager callers,
   one-pool / wrong-pair / dynamic-fee refusals, factory initialization, anti-snipe decay per block,
   the four swap kinds (exact-in/out, buy/sell) through a real `PoolManager`, partial fills with a
