@@ -478,9 +478,109 @@ contract SpongeBotHookEdgesTest is HookTestBase {
         _buy(-1_000 ether, 0);
         uint256 staking = hook.pendingStaking();
         hook.sweep();
-        assertApproxEqAbs(vault.earned(alice), staking * 3 / 4, 1_000);
-        assertApproxEqAbs(vault.earned(bob), staking / 4, 1_000);
-        assertLe(vault.earned(alice) + vault.earned(bob), staking, "never owes more than swept");
+        assertEq(vault.earned(alice) + vault.earned(bob), 0, "no stake-blocks yet: queued, not distributed");
+        assertEq(vault.queuedRewards(), staking);
+        vm.roll(vm.getBlockNumber() + 7);
+        _buy(-1 ether, 0);
+        uint256 total = staking + hook.pendingStaking();
+        hook.sweep();
+        // 400 ether x 7 blocks = 2800e18 stake-blocks: the floored rate leaves under 2800 wei re-queued.
+        assertApproxEqAbs(vault.earned(alice), total * 3 / 4, 3_000);
+        assertApproxEqAbs(vault.earned(bob), total / 4, 3_000);
+        assertLe(vault.earned(alice) + vault.earned(bob) + vault.queuedRewards(), total, "never owes more than swept");
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Staking rewards are time-weighted through the real sweep (the reopened finding)
+    // ---------------------------------------------------------------------------------------------
+
+    function _stakeAs(address who, uint256 amount) internal {
+        token.transfer(who, amount);
+        vm.startPrank(who);
+        token.approve(address(vault), type(uint256).max);
+        vault.stake(amount);
+        vm.stopPrank();
+    }
+
+    /// forge-config: default.fuzz.runs = 200
+    function testFuzz_flashStakeAroundSweepNeverEarns(uint128 bag, uint32 wait, uint128 swapAmount, bool sellSide)
+        public
+    {
+        uint256 bot = bound(uint256(bag), 1, 100_000 ether);
+        uint256 blocks = bound(uint256(wait), 1, 10_000_000);
+        uint256 amount = bound(uint256(swapAmount), 1e12, 10_000 ether);
+        address alice = makeAddr("alice");
+        address botAddr = makeAddr("bot");
+        _stakeAs(alice, 100 ether);
+        vm.roll(vm.getBlockNumber() + blocks);
+        if (sellSide) _sell(-int256(amount), 0);
+        else _buy(-int256(amount), 0);
+        uint256 staking = hook.pendingStaking();
+        vm.assume(staking > 0);
+
+        _stakeAs(botAddr, bot);
+        vm.prank(botAddr);
+        hook.sweep();
+        vm.prank(botAddr);
+        vault.exit();
+
+        assertEq(_imdBalance(botAddr), 0, "zero blocks staked earns nothing through the real sweep");
+        assertEq(token.balanceOf(botAddr), bot);
+        assertLe(vault.earned(alice) + vault.queuedRewards(), staking);
+        assertGe(vault.earned(alice) + vault.queuedRewards() + 1, staking);
+    }
+
+    /// @notice A bot that first resets the epoch with a dust swap plus sweep, then stakes a large bag, only earns its
+    /// stake-share of fees generated while it was staked; everything accrued before went to the incumbent.
+    function test_dustSweepResetBeforeStakingCannotCaptureEarlierFees() public {
+        address alice = makeAddr("alice");
+        address botAddr = makeAddr("bot");
+        _stakeAs(alice, 100 ether);
+        vm.roll(hook.poolOpenBlock() + 10);
+        _buy(-5_000 ether, 0); // the fee the bot would like to take
+        uint256 earlier = hook.pendingStaking();
+        vm.roll(vm.getBlockNumber() + 1_000);
+
+        // Reset: a dust buy so sweep() has something to move, then the sweep closes the epoch to alice alone.
+        _buy(-1e15, 0);
+        vm.prank(botAddr);
+        hook.sweep();
+        assertGe(vault.earned(alice) + vault.queuedRewards(), earlier, "the incumbent got everything accrued so far");
+        assertEq(vault.currentTotalPoints(), 0, "stake-blocks reset");
+
+        _stakeAs(botAddr, 9_900 ether);
+        vm.roll(vm.getBlockNumber() + 1);
+        _buy(-1e15, 0); // a dust fee is all that accrues while the bot is staked
+        uint256 later = hook.pendingStaking() + vault.queuedRewards();
+        vm.prank(botAddr);
+        hook.sweep();
+        vm.prank(botAddr);
+        vault.exit();
+
+        assertLe(_imdBalance(botAddr), later * 99 / 100 + 1, "at most its stake-share of the later dust");
+        assertLt(_imdBalance(botAddr), earlier / 1_000_000, "nothing of the earlier fee");
+        assertGe(vault.earned(alice), earlier - 1);
+    }
+
+    function test_oneBlockStakeThroughSweepEarnsOneBlockShare() public {
+        address alice = makeAddr("alice");
+        address botAddr = makeAddr("bot");
+        uint256 open = hook.poolOpenBlock();
+        _stakeAs(alice, 100 ether);
+        vm.roll(open + 10);
+        _buy(-5_000 ether, 0);
+        uint256 staking = hook.pendingStaking();
+        vm.roll(open + 999);
+        _stakeAs(botAddr, 100_000 ether);
+        vm.roll(open + 1_000);
+        // alice: 100 x 1000 = 100_000 stake-blocks; bot: 100_000 x 1 = 100_000. An even split.
+        hook.sweep();
+        vm.prank(botAddr);
+        vault.exit();
+        // The rate floors over 200_000e18 stake-blocks: under 200_000 wei is re-queued, not paid.
+        assertApproxEqAbs(_imdBalance(botAddr), staking / 2, 200_001);
+        assertApproxEqAbs(vault.earned(alice), staking / 2, 200_001);
+        assertEq(_imdBalance(botAddr) + vault.earned(alice) + vault.queuedRewards(), staking, "exact conservation");
     }
 
     // ---------------------------------------------------------------------------------------------

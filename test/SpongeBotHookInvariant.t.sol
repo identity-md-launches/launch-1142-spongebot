@@ -145,7 +145,7 @@ contract HookHandler is Test {
     }
 
     function roll(uint8 blocks) external {
-        vm.roll(block.number + bound(uint256(blocks), 1, 4));
+        vm.roll(vm.getBlockNumber() + bound(uint256(blocks), 1, 4));
     }
 
     function sweep(uint256 seed) external {
@@ -157,22 +157,52 @@ contract HookHandler is Test {
             if (ok) violations++;
             return;
         }
-        uint256 staked = vault.totalStaked();
-        uint256 queuedBefore = vault.queuedRewards();
+        uint256 pointsTotal = vault.currentTotalPoints();
+        uint256 epochBefore = vault.currentEpoch();
+        uint256 total = staking + vault.queuedRewards();
         vm.prank(_actor(seed));
         hook.sweep();
         antiSwept += anti;
         stakingSwept += staking;
         sweeps++;
         if (staking > 0) {
-            if (staked > 0) {
-                maxDust += staked / 1e18 + 1;
-                if (vault.queuedRewards() != 0) violations++;
-            } else if (vault.queuedRewards() != queuedBefore + staking) {
-                violations++;
+            // Replay the vault's own arithmetic: no stake-blocks queues everything; otherwise the epoch closes and
+            // only the part the floored rate cannot represent is re-queued.
+            if (pointsTotal == 0) {
+                if (vault.queuedRewards() != total) violations++;
+                if (vault.currentEpoch() != epochBefore) violations++;
+            } else {
+                uint256 rate = total * 1e18 / pointsTotal;
+                uint256 distributed = (rate * pointsTotal + 1e18 - 1) / 1e18;
+                if (vault.queuedRewards() != total - distributed) violations++;
+                if (vault.currentEpoch() != epochBefore + 1) violations++;
+                maxDust += 1;
             }
+        } else if (vault.currentEpoch() != epochBefore) {
+            violations++; // nothing notified: the vault must not have been touched
         }
         if (hook.pending() != 0) violations++;
+    }
+
+    /// @dev The reopened finding through the real hook: stake, sweep and exit in one block earns nothing.
+    function flashStakeAroundSweep(uint256 seed, uint256 amount) external {
+        address who = _actor(seed);
+        if (vault.stakedBalance(who) != 0 || vault.points(who) != 0) return;
+        if (hook.pendingStaking() == 0) return;
+        amount = bound(amount, 1, 50_000 ether);
+        if (token.balanceOf(address(this)) < amount + 1_000_000 ether) return;
+        token.transfer(who, amount);
+        tokensGivenToActors += amount;
+        uint256 owedBefore = vault.earned(who);
+        uint256 imdBefore = IERC20Minimal(imd).balanceOf(who);
+        vm.prank(who);
+        vault.stake(amount);
+        this.sweep(seed);
+        vm.prank(who);
+        vault.exit();
+        if (IERC20Minimal(imd).balanceOf(who) - imdBefore != owedBefore) violations++;
+        claimed += owedBefore;
+        maxDust += 3;
     }
 
     function stake(uint256 seed, uint256 amount) external {
